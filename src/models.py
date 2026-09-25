@@ -1,107 +1,123 @@
-"""Metrics for ranked alert lists and probabilities.
-
-Top-k lists: when several students share the score at the cut-off of the list, the
-reported numbers are the *expected* hits under random tie-breaking, so they do not depend
-on any random generator. Only the decision tree has ties large enough to matter.
-A concrete list (for confusion-matrix figures or overlaps) uses a local seed.
-"""
+"""Classifiers, imbalance strategies and hyperparameter draws."""
 import numpy as np
+from imblearn.ensemble import BalancedRandomForestClassifier, RUSBoostClassifier
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from imblearn.pipeline import Pipeline
+from imblearn.under_sampling import RandomUnderSampler
+from scipy.stats import loguniform
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.kernel_approximation import Nystroem
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, brier_score_loss, confusion_matrix, roc_auc_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
+import config
 from src.reproducibility import make_seed
 
 
-def list_size(n, share):
-    return max(1, int(round(share * n)))
+def combinations():
+    """The 27 model/strategy pairs of the study."""
+    pairs = [(m, s) for m in config.GENERAL_MODELS for s in config.STRATEGIES]
+    return pairs + [(m, "built-in") for m in config.BUILTIN_MODELS]
 
 
-def expected_hits(y, scores, k):
-    """Expected number of positives in the top-k list, ties broken at random."""
-    y, scores = np.asarray(y), np.asarray(scores)
-    cutoff = np.partition(scores, -k)[-k]
-    above = scores > cutoff
-    tied = scores == cutoff
-    return y[above].sum() + (k - above.sum()) * y[tied].mean()
+def _pick(rng, options):
+    return options[rng.integers(len(options))]
 
 
-def top_k_indices(scores, k, seed):
-    """One concrete top-k list; ties at the cut-off are broken with a local generator."""
-    noise = np.random.default_rng(seed).random(len(scores))
-    return np.lexsort((noise, -np.asarray(scores)))[:k]
+def _draw(rng, space):
+    params = {}
+    for name, options in space.items():
+        if isinstance(options, tuple) and options[0] == "loguniform":
+            params[name] = float(loguniform(options[1], options[2]).rvs(random_state=rng))
+        else:
+            params[name] = _pick(rng, options)
+    return params
 
 
-def recall_at_k(y, scores, k):
-    return expected_hits(y, scores, k) / np.sum(y)
+def draw_setting(model, strategy, index, base_seed=config.BASE_SEED):
+    """Hyperparameter setting number ``index`` of the random search for (model, strategy)."""
+    rng = np.random.default_rng(make_seed(model, strategy, index, "search_draw", base_seed=base_seed))
+    params = _draw(rng, config.SEARCH_SPACES[model])
+    if strategy == "weight":
+        params |= _draw(rng, config.STRATEGY_SPACES["weight"])
+    if strategy in ("RUS", "ROS", "SMOTE"):
+        params |= _draw(rng, config.STRATEGY_SPACES["resampling"])
+    if strategy == "SMOTE":
+        params |= _draw(rng, config.STRATEGY_SPACES["smote"])
+    return params
 
 
-def precision_at_k(y, scores, k):
-    return expected_hits(y, scores, k) / k
+def positive_weight(params, ratio):
+    """Weight of the positive class; ``ratio`` = negatives / positives in the training data."""
+    if "w_mode" not in params:
+        return 1.0
+    if params["w_mode"] == "sqrt":
+        return float(np.sqrt(ratio))
+    return float(ratio * params["w_mult"])
 
 
-def calculate_model_metrics(y, scores, has_prob=True, prevalence_ref=None):
-    """PR-AUC, ROC-AUC, list metrics and, for probabilities, Brier and Brier skill score.
-
-    The Brier skill score uses as reference a constant forecast equal to
-    ``prevalence_ref`` (the training prevalence, known when the model is used).
-    """
-    n = len(y)
-    out = {"ap": average_precision_score(y, scores), "auc": roc_auc_score(y, scores)}
-    for share, label in [(0.01, "1"), (0.05, "5")]:
-        k = list_size(n, share)
-        out[f"recall_top{label}"] = recall_at_k(y, scores, k)
-        out[f"precision_top{label}"] = precision_at_k(y, scores, k)
-    if has_prob:
-        out["brier"] = brier_score_loss(y, scores)
-        out["mean_prob"] = float(np.mean(scores))
-        if prevalence_ref is not None:
-            ref = brier_score_loss(y, np.full(n, prevalence_ref))
-            out["brier_skill"] = 1 - out["brier"] / ref
-    return out
-
-
-def calculate_default_threshold_metrics(y, scores, has_prob=True):
-    """Confusion matrix at the libraries' default threshold (0.5, or 0 for the SVM)."""
-    flagged = (np.asarray(scores) >= (0.5 if has_prob else 0.0)).astype(int)
-    return calculate_confusion_matrix_metrics(y, flagged)
-
-
-def calculate_confusion_matrix_metrics(y, flagged):
-    tn, fp, fn, tp = confusion_matrix(y, flagged, labels=[0, 1]).ravel()
-    return {"flagged": int(tp + fp), "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
-            "recall": tp / max(tp + fn, 1), "precision": tp / (tp + fp) if tp + fp else np.nan,
-            "specificity": tn / max(tn + fp, 1)}
-
-
-def top_k_confusion(y, scores, share, model, strategy):
-    """Confusion matrix of one concrete top-k list (seeded tie-breaking)."""
-    k = list_size(len(y), share)
-    flagged = np.zeros(len(y), dtype=int)
-    flagged[top_k_indices(scores, k, make_seed(model, strategy, int(share * 1000), "tie"))] = 1
-    return calculate_confusion_matrix_metrics(y, flagged), flagged
+def make_classifier(model, p, seed, w=1.0):
+    weights = {0: 1, 1: w}
+    if model == "LR":
+        return LogisticRegression(C=p["C"], class_weight=weights, max_iter=3000)
+    if model == "DT":
+        return DecisionTreeClassifier(max_depth=p["max_depth"], min_samples_leaf=p["msl"],
+                                      class_weight=weights, random_state=seed)
+    if model == "SVM":
+        # RBF kernel approximated with Nystroem, then a linear SVM in that space;
+        # an exact kernel SVM is not feasible for ~47k training rows
+        return Pipeline([("nystroem", Nystroem(gamma=p["gamma"], n_components=config.NYSTROEM_COMPONENTS,
+                                               random_state=seed)),
+                         ("svc", LinearSVC(C=p["C"], class_weight=weights, max_iter=5000))])
+    if model == "RF":
+        return RandomForestClassifier(n_estimators=config.N_TREES, max_depth=p["max_depth"],
+                                      min_samples_leaf=p["msl"], max_features=p["mf"],
+                                      class_weight=weights, random_state=seed, n_jobs=1)
+    if model == "XGB":
+        return XGBClassifier(n_estimators=p["n"], max_depth=p["depth"], learning_rate=p["lr"],
+                             min_child_weight=p["mcw"], subsample=p["ss"], colsample_bytree=p["cs"],
+                             scale_pos_weight=w, tree_method="hist", random_state=seed,
+                             n_jobs=1, verbosity=0)
+    if model == "BRF":
+        return BalancedRandomForestClassifier(n_estimators=config.N_TREES, max_depth=p["max_depth"],
+                                              min_samples_leaf=p["msl"], max_features=p["mf"],
+                                              sampling_strategy=p["ratio"], replacement=True,
+                                              bootstrap=False, random_state=seed, n_jobs=1)
+    if model == "RUSBoost":
+        return RUSBoostClassifier(estimator=DecisionTreeClassifier(max_depth=p["depth"]),
+                                  n_estimators=p["n"], learning_rate=p["lr"],
+                                  sampling_strategy=p["ratio"], random_state=seed)
+    raise ValueError(f"unknown model {model}")
 
 
-def _logit(p):
-    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
-    return np.log(p / (1 - p))
+def make_pipeline(model, strategy, p, seed, ratio):
+    """Imputation and scaling, resampling (training data only) and the classifier."""
+    steps = [("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]
+    if strategy == "RUS":
+        steps.append(("resample", RandomUnderSampler(sampling_strategy=p["ratio_s"], random_state=seed)))
+    elif strategy == "ROS":
+        steps.append(("resample", RandomOverSampler(sampling_strategy=p["ratio_s"], random_state=seed)))
+    elif strategy == "SMOTE":
+        steps.append(("resample", SMOTE(sampling_strategy=p["ratio_s"], k_neighbors=p["k"], random_state=seed)))
+    steps.append(("model", make_classifier(model, p, seed, positive_weight(p, ratio))))
+    return Pipeline(steps)
 
 
-def calculate_calibration_metrics(y, p):
-    """Calibration-in-the-large, observed/expected ratio, calibration intercept and slope.
+def fit_and_score(model, strategy, params, seed, X_train, y_train, X_test):
+    """Fit one pipeline and return scores for X_test (decision function for the SVM)."""
+    if len(np.unique(y_train)) < 2:
+        raise ValueError("training data contain a single class")
+    ratio = (len(y_train) - y_train.sum()) / y_train.sum()
+    pipe = make_pipeline(model, strategy, params, seed, ratio)
+    pipe.fit(X_train, y_train)
+    if model == "SVM":
+        return pipe.decision_function(X_test)
+    return pipe.predict_proba(X_test)[:, 1]
 
-    The intercept is estimated with the slope fixed at 1 (logit(p) as offset); the slope
-    comes from a logistic regression of the outcome on logit(p).
-    """
-    y = np.asarray(y)
-    lp = _logit(p)
-    slope = LogisticRegression(C=1e6, max_iter=1000).fit(lp.reshape(-1, 1), y).coef_[0][0]
-    a = 0.0
-    for _ in range(50):
-        q = 1 / (1 + np.exp(-(a + lp)))
-        step = (y - q).sum() / (q * (1 - q)).sum()
-        a += step
-        if abs(step) < 1e-10:
-            break
-    return {"observed": y.mean(), "mean_pred": float(np.mean(p)),
-            "citl": y.mean() - float(np.mean(p)), "o_e": y.mean() / float(np.mean(p)),
-            "intercept": a, "slope": slope}
+
+def has_probabilities(model):
+    return model != "SVM"
